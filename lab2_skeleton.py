@@ -3,7 +3,7 @@ import sys
 import os
 import enum
 import socket
-
+import select
 
 cache = {}
 
@@ -85,6 +85,9 @@ class HttpRequestInfo(object):
         print(f"Port:", self.requested_port)
         stringified = [": ".join([k, v]) for (k, v) in self.headers]
         print("Headers:\n", "\n".join(stringified))
+    
+    def get_key(self):
+        return self.requested_host+self.requested_path+":"+str(self.requested_port)
 
 
 class HttpErrorResponse(object):
@@ -132,8 +135,8 @@ def entry_point(proxy_port_number):
     inside it.
     """
 
-    s = setup_sockets(proxy_port_number)
-    serve_clients(s)
+    server = setup_sockets(proxy_port_number)
+    serve_clients(server)
     # print("*" * 50)
     # print("[entry_point] Implement me!")
     # print("*" * 50)
@@ -152,6 +155,7 @@ def setup_sockets(proxy_port_number):
     print("Starting HTTP proxy on port:", proxy_port_number)
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.setblocking(0)
     s.bind((socket.gethostname(), proxy_port_number))
     # when calling socket.listen() pass a number
     # that's larger than 10 to avoid rejecting
@@ -161,37 +165,91 @@ def setup_sockets(proxy_port_number):
     # print("*" * 50)
     return s
 
-
-def serve_clients(s):
-    s.listen(15)
+def serve_clients(server):
+    server.listen(15)
+    inputs = [server]
+    outputs = []
+    # For tracking every client request in case the request isn't completely recieved in a single 'recv'
+    client_requests = {}
+    # For tracking every response from the remote host in case the response isn't completely recieved in a single 'recv'
+    remote_responses = {}
+    # A set for distinguishing clients from remote_hosts in readable sockets
+    clients = set()
+    # ( remote_socket: client_socket ) used to know which client should recieve the response that came from the remote host
+    remote_to_client = {}
+    # ( client_socket: key ) used to cache the response when the client is successfully served
+    temporary_keys = {}
     while True:
-        request = ""
-        client_socket, address = s.accept()
-        print(f"Connection from {address} has been established.")
-        while request[-4:] != "\r\n\r\n":
-            inc = client_socket.recv(512)
-            if inc != b'':
-                print(f"Recieved a packet {inc} from {address}")
-                request += inc.decode("utf-8")
-        parsed_request = http_request_pipeline(address, request)
-        validity = check_http_request_validity(parsed_request)
-        if validity == HttpRequestState.INVALID_INPUT:
-            client_socket.send(bytes(HttpErrorResponse(400, "Bad Request").to_http_string(), "utf-8"))
-        elif validity == HttpRequestState.NOT_SUPPORTED:
-            client_socket.send(bytes(HttpErrorResponse(501, "Not Implemented").to_http_string(), "utf-8"))
-        else:
-            key = parsed_request.requested_host+parsed_request.requested_path+":"+str(parsed_request.requested_port)
-            if key in cache:
-                client_socket.send(cache[key])
+        print("Waiting for any event...")
+        readable, writable,_ = select.select(inputs, outputs, inputs)
+        for s in readable:
+            # If this readable is the server then it's ready for accepting a new connection
+            if s is server:
+                client_socket, client_address = s.accept()
+                print(f"Connection with {client_address} established!")
+                client_socket.setblocking(0)
+                inputs.append(client_socket)
+                clients.add(client_socket)
+                client_requests[client_socket] = ""
+            # If it's a client then recieve the next packet, if the request is complete, send it to the remote host
+            elif s in clients:
+                data = s.recv(1024)
+                if data:
+                    print(f"Recieved a packet {data} from {s.getpeername()}")
+                    client_requests[s] += data.decode("utf-8")
+                    # If request is completely recieved
+                    if client_requests[s][-4:] == "\r\n\r\n":
+                        request = client_requests[s]
+                        parsed_request = http_request_pipeline(s.getpeername(), request)
+                        validity = check_http_request_validity(parsed_request)
+                        if validity == HttpRequestState.GOOD:
+                            key = parsed_request.get_key()
+                            if key in cache:
+                                s.send(bytes(cache[key], "utf-8"))
+                                end_connection(s, inputs)
+                            else:
+                                remote_host = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                                send_request_to_remote(parsed_request, remote_host)
+                                remote_responses[remote_host] = ""
+                                inputs.append(remote_host)
+                                remote_to_client[remote_host] = s
+                                temporary_keys[s] = key
+                        elif validity == HttpRequestState.INVALID_INPUT:
+                            s.send(bytes(HttpErrorResponse(400, "Bad Request").to_http_string(), "utf-8"))
+                            end_connection(s, inputs)
+                        elif validity == HttpRequestState.NOT_SUPPORTED:
+                            s.send(bytes(HttpErrorResponse(501, "Not Implemented").to_http_string(), "utf-8"))
+                            end_connection(s, inputs)
+                # If data is empty then the client has disconnected
+                else:
+                    print(f"Closing {s.getpeername()} after reading no data")
+                    # Stop listening for input on the connection
+                    end_connection(s, inputs)
+                    # Remove message queue
+                    del client_requests[s]
             else:
-                s2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s2.connect((parsed_request.requested_host, parsed_request.requested_port))
-                s2.send(bytes(parsed_request.to_http_string(), "utf-8"))
-                response = s2.recv(2048)
-                cache[key] = response
-                client_socket.send(response)
+                response = s.recv(2048)
+                if response:
+                    remote_responses[s] += response.decode("utf-8")
+                else:
+                    full_response = remote_responses[s]
+                    associated_client = remote_to_client[s]
+                    associated_client.send(bytes(full_response, "utf-8"))
+                    cache[temporary_keys[associated_client]] = full_response
+                    end_connection(s, inputs)
+                    end_connection(associated_client, inputs)
+                    del remote_responses[s]
+                    del remote_to_client[s]
 
 
+def end_connection(s, inputs):
+    inputs.remove(s)
+    s.close()
+
+def send_request_to_remote(parsed_request, remote_host):
+    remote_host.connect((parsed_request.requested_host, parsed_request.requested_port))
+    remote_host.setblocking(0)
+    remote_host.sendall(bytes(parsed_request.to_http_string(), "utf-8"))
 
 def http_request_pipeline(source_addr, http_raw_data):
     """
