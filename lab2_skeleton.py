@@ -5,6 +5,8 @@ import enum
 import socket
 
 
+cache = {}
+
 class HttpRequestInfo(object):
     """
     Represents a HTTP request information
@@ -149,6 +151,7 @@ def setup_sockets(proxy_port_number):
     """
     print("Starting HTTP proxy on port:", proxy_port_number)
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind((socket.gethostname(), proxy_port_number))
     # when calling socket.listen() pass a number
     # that's larger than 10 to avoid rejecting
@@ -177,8 +180,16 @@ def serve_clients(s):
         elif validity == HttpRequestState.NOT_SUPPORTED:
             client_socket.send(bytes(HttpErrorResponse(501, "Not Implemented").to_http_string(), "utf-8"))
         else:
-            client_socket.send(bytes("No problems found", "utf-8"))
-
+            key = parsed_request.requested_host+parsed_request.requested_path+":"+str(parsed_request.requested_port)
+            if key in cache:
+                client_socket.send(cache[key])
+            else:
+                s2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s2.connect((parsed_request.requested_host, parsed_request.requested_port))
+                s2.send(bytes(parsed_request.to_http_string(), "utf-8"))
+                response = s2.recv(2048)
+                cache[key] = response
+                client_socket.send(response)
 
 
 
